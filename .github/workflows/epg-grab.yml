@@ -1,0 +1,107 @@
+# TV Guide data. Every six hours: ask the Worker which XMLTV channels users
+# have matched, grab their schedules with the open-source iptv-org/epg
+# grabbers (each broadcaster's own listings), split the result into one JSON
+# file per channel and upload to the EPG R2 bucket the Worker reads.
+# See epg/README.md.
+name: EPG grab
+
+on:
+  schedule:
+    - cron: "15 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: epg-grab
+  cancel-in-progress: false
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # The wanted list grows as users match more channels (162 and counting
+      # as of 2026-09-24) — a demand-driven design, on purpose. V8's default
+      # old-space ceiling on this runner sat well under 2 GB and the grab
+      # step OOM'd (heap-out-of-memory, exit 134) mid-pass on a site whose
+      # per-programme payloads are much heavier than another site's for the
+      # same channel count (tvguide.com vs the near-empty tvtv.us). The
+      # standard ubuntu-latest runner has ~7 GB; this leaves headroom for
+      # git/npm/node's own overhead. Bump further if `wanted` keeps growing
+      # and this recurs — or split the grab into fixed-size channel-file
+      # chunks per invocation (xmltv-to-json.mjs already merges any number
+      # of guide files), which scales indefinitely instead of just deferring
+      # the ceiling.
+      NODE_OPTIONS: --max-old-space-size=6144
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned: a grabber change upstream should not silently change what
+      # ships. Bump the ref deliberately (and re-run the epg/ tests).
+      - uses: actions/checkout@v4
+        with:
+          repository: iptv-org/epg
+          ref: 78e94adb76841a63d94a53e80dbd0d52bb7c2c5c
+          path: epg/upstream
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the grabbers
+        working-directory: epg/upstream
+        run: npm install --no-audit --no-fund
+
+      - name: Install the job's own dependencies
+        working-directory: epg
+        run: npm install --no-audit --no-fund
+
+      - name: Build the channel list and the matching index
+        env:
+          WORKER_URL: ${{ vars.TVAI_WORKER_URL || 'https://tv-ai-proxy.tvai.workers.dev' }}
+          ADMIN_SECRET: ${{ secrets.TVAI_ADMIN_SECRET }}
+        run: node epg/scripts/build-channels.mjs
+
+      # Up to three passes: a channel that comes back empty from its first
+      # site (a broken grabber, a 404, a layout change) is retried on the
+      # next site that carries it. Pass N+1's list is built from what passes
+      # 1…N actually produced.
+      - name: Grab (pass 1)
+        working-directory: epg/upstream
+        run: |
+          if grep -q "<channel " ../work/custom.channels.xml; then
+            npm run grab --- --channels=../work/custom.channels.xml --days=3 --maxConnections=10 --timeout=45000 --output=../work/guide-1.xml
+          else
+            echo "Nothing wanted yet — skipping the grab"
+          fi
+      - name: Retry the empty channels elsewhere (pass 2)
+        working-directory: epg/upstream
+        run: |
+          node ../scripts/retry-missing.mjs ../work 1
+          if grep -q "<channel " ../work/pass-2.channels.xml; then
+            npm run grab --- --channels=../work/pass-2.channels.xml --days=3 --maxConnections=10 --timeout=45000 --output=../work/guide-2.xml
+          fi
+      - name: Retry the empty channels elsewhere (pass 3)
+        working-directory: epg/upstream
+        run: |
+          node ../scripts/retry-missing.mjs ../work 2
+          if grep -q "<channel " ../work/pass-3.channels.xml; then
+            npm run grab --- --channels=../work/pass-3.channels.xml --days=3 --maxConnections=10 --timeout=45000 --output=../work/guide-3.xml
+          fi
+          node ../scripts/retry-missing.mjs ../work 3
+
+      - name: Split into per-channel JSON
+        run: node epg/scripts/xmltv-to-json.mjs epg/work/out epg/work/guide-1.xml epg/work/guide-2.xml epg/work/guide-3.xml
+
+      - name: Upload to R2
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: node epg/scripts/upload-r2.mjs epg/work/out epg/work
+
+      - name: Summary
+        run: |
+          echo "### EPG grab" >> "$GITHUB_STEP_SUMMARY"
+          cat epg/work/wanted.json >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          cat epg/work/out/epg/_meta.json >> "$GITHUB_STEP_SUMMARY"
